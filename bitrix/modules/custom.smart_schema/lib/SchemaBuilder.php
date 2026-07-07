@@ -130,7 +130,10 @@ class SchemaBuilder
             if (!$this->hasType($analysis, ['WebPage'])) { $types[] = 'WebPage'; }
         }
 
-        if (!empty($analysis['faq_pairs']) && !$this->hasType($analysis, ['FAQPage']) && !in_array('FAQPage', $types, true)) { $types[] = 'FAQPage'; }
+        // FAQPage не навешиваем на юридические/транзакционные страницы: там «вопросы» — это
+        // подзаголовки документа (политика, оферта, условия), а не пользовательский FAQ.
+        $faqInappropriate = in_array($kind, ['legal_page','cart_page','checkout_page','profile_page'], true);
+        if (!$faqInappropriate && !empty($analysis['faq_pairs']) && !$this->hasType($analysis, ['FAQPage']) && !in_array('FAQPage', $types, true)) { $types[] = 'FAQPage'; }
         if (!empty($analysis['videos']) && !$this->hasType($analysis, ['VideoObject']) && !in_array('VideoObject', $types, true)) { $types[] = 'VideoObject'; }
         return array_values(array_unique($types));
     }
