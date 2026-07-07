@@ -8,8 +8,14 @@ class Db
     public const PROPOSALS = 'b_custom_smart_schema_proposals';
     public const LOGS = 'b_custom_smart_schema_logs';
 
+    private static bool $installed = false;
+
     public static function install(): void
     {
+        // Проверка/миграция схемы (isTableExists + SHOW COLUMNS) не должна выполняться на каждый
+        // вызов: activeForKind()/activeForRequest() дёргаются на каждой странице сайта через
+        // main:OnEndBufferContent. Достаточно один раз за запрос.
+        if (self::$installed) { return; }
         $connection = Application::getConnection();
         if (!$connection->isTableExists(self::PROPOSALS)) {
             $connection->queryExecute("CREATE TABLE " . self::PROPOSALS . " (
@@ -74,6 +80,7 @@ class Db
                 KEY ix_created (CREATED_AT)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
         }
+        self::$installed = true;
     }
 
     private static function ensureColumn(string $name, string $definition, string $after = ''): void
