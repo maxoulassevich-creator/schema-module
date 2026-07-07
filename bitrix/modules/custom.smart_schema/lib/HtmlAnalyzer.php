@@ -1,0 +1,838 @@
+<?php
+namespace Custom\SmartSchema;
+
+use Bitrix\Main\Web\HttpClient;
+
+class HtmlAnalyzer
+{
+    public function fetchUrl(string $url): array
+    {
+        $url = Security::normalizeUrl($url);
+        if ($url === '') {
+            return ['ok' => false, 'status' => 0, 'error' => 'URL не задан', 'html' => '', 'url' => $url];
+        }
+        $client = new HttpClient(['socketTimeout' => (int)Options::get('scan_external_http_timeout', '15'), 'streamTimeout' => (int)Options::get('scan_external_http_timeout', '15')]);
+        $client->setHeader('User-Agent', 'SmartSchemaBitrix/1.0 (+1C-Bitrix module)');
+        $client->setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        $client->setHeader('Pragma', 'no-cache');
+        $html = (string)$client->get($url);
+        $status = (int)$client->getStatus();
+        if ($status < 200 || $status >= 400 || $html === '') {
+            return ['ok' => false, 'status' => $status, 'error' => 'Страница не загружена или вернула HTTP ' . $status, 'html' => $html, 'url' => $url];
+        }
+        return ['ok' => true, 'status' => $status, 'error' => '', 'html' => $html, 'url' => $url];
+    }
+
+    public function analyzeUrl(string $url): array
+    {
+        $fetch = $this->fetchUrl($url);
+        $analysis = $fetch['ok'] ? $this->analyzeHtml((string)$fetch['html'], (string)$fetch['url']) : [];
+        return ['fetch' => $fetch, 'analysis' => $analysis];
+    }
+
+    public function analyzeHtml(string $html, string $url = ''): array
+    {
+        $jsonLd = $this->extractJsonLd($html);
+        $images = $this->extractImages($html, $url);
+        $microdataTypeList = $this->extractMicrodataTypeList($html);
+        $microdataTypes = array_values(array_unique($microdataTypeList));
+        $jsonTypes = $this->schemaTypes($jsonLd);
+
+        return [
+            'url' => $url,
+            'title' => $this->extractTitle($html),
+            'meta_description' => $this->extractMeta($html, 'description'),
+            'canonical' => $this->extractCanonical($html, $url),
+            'og_title' => $this->extractMeta($html, 'og:title', true),
+            'og_description' => $this->extractMeta($html, 'og:description', true),
+            'og_image' => $this->extractMeta($html, 'og:image', true),
+            'h1' => $this->extractHeadings($html, 'h1'),
+            'h2' => $this->extractHeadings($html, 'h2'),
+            'json_ld' => $jsonLd,
+            'json_ld_types' => $jsonTypes,
+            'microdata_types' => $microdataTypes,
+            'microdata_type_counts' => $this->typeCounts($microdataTypeList),
+            'existing_schema_types' => array_values(array_unique(array_merge($jsonTypes, $microdataTypes))),
+            'microdata_count' => preg_match_all('/\bitemscope\b/i', $html),
+            'breadcrumbs' => $this->extractBreadcrumbs($html, $url),
+            'faq_pairs' => $this->extractFaq($html),
+            'videos' => $this->extractVideos($html, $url),
+            'images' => $images,
+            'primary_image' => $this->primaryImage($images, $html, $url),
+            'product' => $this->shouldExtractProductSignals($html, $url, $jsonLd) ? $this->extractProductSignals($html, $url, $jsonLd) : $this->emptyProductSignals($url),
+            'microdata_product' => $this->shouldExtractProductSignals($html, $url, $jsonLd) ? $this->extractMicrodataProductSignals($html, $url) : $this->emptyMicrodataProductSignals(),
+            'items' => $this->extractListItems($html, $url, $jsonLd),
+            'reviews' => $this->extractReviews($html, $url),
+            'dates' => $this->extractDates($html),
+            'word_count' => $this->countWords(Security::text($html, 50000)),
+            'html_length' => strlen($html),
+        ];
+    }
+
+    private function extractTitle(string $html): string
+    {
+        return preg_match('/<title[^>]*>(.*?)<\/title>/isu', $html, $m) ? trim(html_entity_decode(strip_tags($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8')) : '';
+    }
+
+    private function extractMeta(string $html, string $name, bool $property = false): string
+    {
+        $attr = $property ? 'property' : 'name';
+        if (preg_match('/<meta[^>]+'.$attr.'=["\']'.preg_quote($name, '/').'["\'][^>]+content=["\']([^"\']*)["\'][^>]*>/isu', $html, $m)) {
+            return trim(html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        }
+        if (preg_match('/<meta[^>]+content=["\']([^"\']*)["\'][^>]+'.$attr.'=["\']'.preg_quote($name, '/').'["\'][^>]*>/isu', $html, $m)) {
+            return trim(html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        }
+        return '';
+    }
+
+    private function extractCanonical(string $html, string $url): string
+    {
+        if (preg_match('/<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)["\']/isu', $html, $m)) {
+            return Security::absUrl(html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'), $url);
+        }
+        return Security::normalizeUrl($url);
+    }
+
+    private function extractHeadings(string $html, string $tag): array
+    {
+        $items = [];
+        if (preg_match_all('/<'.$tag.'\b[^>]*>(.*?)<\/'.$tag.'>/isu', $html, $m)) {
+            foreach ($m[1] as $text) {
+                $clean = $this->cleanText($text);
+                if ($clean !== '') { $items[] = mb_substr($clean, 0, 300); }
+            }
+        }
+        return array_slice(array_values(array_unique($items)), 0, 20);
+    }
+
+    public function extractJsonLd(string $html): array
+    {
+        $schemas = [];
+        if (preg_match_all('/<script[^>]+type=["\']application\/ld\+json["\'][^>]*>(.*?)<\/script>/isu', $html, $matches)) {
+            foreach ($matches[1] as $raw) {
+                $raw = trim(html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+                if ($raw === '') { continue; }
+                $decoded = json_decode($raw, true);
+                if (json_last_error() === JSON_ERROR_NONE) {
+                    $schemas[] = $decoded;
+                } else {
+                    $schemas[] = ['_invalid_json' => true, '_error' => json_last_error_msg(), '_raw' => mb_substr($raw, 0, 1000)];
+                }
+            }
+        }
+        return $schemas;
+    }
+
+    public function schemaTypes(array $schemas): array
+    {
+        $types = [];
+        foreach ($schemas as $schema) {
+            $types = array_merge($types, $this->flattenTypes($schema));
+        }
+        return array_values(array_unique(array_filter($types)));
+    }
+
+    private function flattenTypes($node): array
+    {
+        if (!is_array($node)) { return []; }
+        $types = [];
+        if (isset($node['@type'])) {
+            foreach ((array)$node['@type'] as $t) { $types[] = (string)$t; }
+        }
+        foreach (['@graph','mainEntity','itemListElement','hasVariant','offers','blogPost','review','aggregateRating','author','publisher'] as $key) {
+            if (isset($node[$key])) {
+                $children = is_array($node[$key]) && array_keys($node[$key]) === range(0, count($node[$key])-1) ? $node[$key] : [$node[$key]];
+                foreach ($children as $child) { $types = array_merge($types, $this->flattenTypes($child)); }
+            }
+        }
+        return $types;
+    }
+
+    private function extractMicrodataTypeList(string $html): array
+    {
+        $types = [];
+        if (preg_match_all('/itemtype=["\']https?:\/\/schema\.org\/([^"\'#\s>]+)["\']/isu', $html, $m)) {
+            foreach ($m[1] as $type) {
+                $type = trim($type);
+                if ($type !== '') { $types[] = $type; }
+            }
+        }
+        return $types;
+    }
+
+    private function typeCounts(array $types): array
+    {
+        $counts = [];
+        foreach ($types as $type) {
+            $type = (string)$type;
+            if ($type === '') { continue; }
+            $counts[$type] = ($counts[$type] ?? 0) + 1;
+        }
+        return $counts;
+    }
+
+    private function extractBreadcrumbs(string $html, string $url): array
+    {
+        $dom = $this->dom($html);
+        if ($dom) {
+            $xp = new \DOMXPath($dom);
+            $blocks = $xp->query('//*[contains(translate(@itemtype,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "schema.org/breadcrumblist")]');
+            if ($blocks && $blocks->length) {
+                foreach ($blocks as $block) {
+                    $items = [];
+                    foreach ($block->childNodes as $node) {
+                        if (!$node instanceof \DOMElement) { continue; }
+                        $class = ' ' . $node->getAttribute('class') . ' ';
+                        if (strpos($class, ' breadcrumbs__item ') === false || $node->getAttribute('itemprop') !== 'itemListElement') { continue; }
+                        $nameNode = $xp->query('.//*[@itemprop="name"]', $node)->item(0);
+                        $name = $nameNode ? $this->normalizeItemName($nameNode->textContent) : '';
+                        $urlNode = $xp->query('.//a[@itemprop="item"]/@href | .//link[@itemprop="item"]/@href | .//*[@itemprop="item"]/@href', $node)->item(0);
+                        $href = $urlNode ? (string)$urlNode->nodeValue : '';
+                        $posNode = $xp->query('.//*[@itemprop="position"]/@content', $node)->item(0);
+                        $pos = $posNode ? (int)$posNode->nodeValue : 0;
+                        if ($name !== '' && $href !== '') {
+                            $items[] = ['name' => $name, 'url' => Security::absUrl($href, $url), 'position' => $pos ?: count($items) + 1];
+                        }
+                    }
+                    if ($items) {
+                        usort($items, static fn($a, $b) => ($a['position'] <=> $b['position']));
+                        $out = [];
+                        $seen = [];
+                        foreach ($items as $item) {
+                            $key = mb_strtolower($item['name'] . '|' . $item['url']);
+                            if (isset($seen[$key])) { continue; }
+                            $seen[$key] = true;
+                            unset($item['position']);
+                            $out[] = $item;
+                        }
+                        return array_slice($out, 0, 15);
+                    }
+                }
+            }
+        }
+
+        $regexCrumbs = $this->breadcrumbsFromRegex($html, $url);
+        if ($regexCrumbs) { return $regexCrumbs; }
+        return [];
+    }
+
+    private function breadcrumbsFromRegex(string $html, string $url): array
+    {
+        $crumbs = [];
+        if (preg_match_all('/<(div|span)\b[^>]*class=["\'][^"\']*breadcrumbs__item[^"\']*["\'][^>]*itemprop=["\']itemListElement["\'][^>]*>(.*?)<\/\1>/isu', $html, $m, PREG_SET_ORDER)) {
+            foreach ($m as $row) {
+                $block = $row[2];
+                $name = '';
+                $href = '';
+                $pos = 0;
+                if (preg_match('/itemprop=["\']name["\'][^>]*>([^<]+)/isu', $block, $nm)) {
+                    $name = $this->normalizeItemName($nm[1]);
+                }
+                if (preg_match('/<a[^>]+itemprop=["\']item["\'][^>]+href=["\']([^"\']+)["\']/isu', $block, $hm) || preg_match('/<a[^>]+href=["\']([^"\']+)["\'][^>]+itemprop=["\']item["\']/isu', $block, $hm)) {
+                    $href = html_entity_decode($hm[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                } elseif (preg_match('/<link[^>]+href=["\']([^"\']+)["\'][^>]+itemprop=["\']item["\']/isu', $block, $hm) || preg_match('/<link[^>]+itemprop=["\']item["\'][^>]+href=["\']([^"\']+)["\']/isu', $block, $hm)) {
+                    $href = html_entity_decode($hm[1], ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                }
+                if (preg_match('/itemprop=["\']position["\'][^>]+content=["\'](\d+)["\']/isu', $block, $pm) || preg_match('/content=["\'](\d+)["\'][^>]+itemprop=["\']position["\']/isu', $block, $pm)) {
+                    $pos = (int)$pm[1];
+                }
+                if ($name !== '' && $href !== '') {
+                    $crumbs[] = ['name' => $name, 'url' => Security::absUrl($href, $url), 'position' => $pos ?: count($crumbs) + 1];
+                }
+            }
+        }
+        if (!$crumbs) { return []; }
+        usort($crumbs, static fn($a, $b) => ($a['position'] <=> $b['position']));
+        $out = [];
+        $seen = [];
+        foreach ($crumbs as $crumb) {
+            $key = mb_strtolower($crumb['name'] . '|' . $crumb['url']);
+            if (isset($seen[$key])) { continue; }
+            $seen[$key] = true;
+            unset($crumb['position']);
+            $out[] = $crumb;
+        }
+        return array_slice($out, 0, 15);
+    }
+
+    private function extractFaq(string $html): array
+    {
+        $pairs = [];
+        if (preg_match_all('/<(h[2-6]|summary)[^>]*>([^<]{5,200}\?)<\/\1>\s*<(p|div)[^>]*>(.*?)<\/\3>/isu', $html, $m, PREG_SET_ORDER)) {
+            foreach ($m as $row) {
+                $q = $this->cleanText($row[2]);
+                $a = $this->cleanText($row[4]);
+                if ($q !== '' && $a !== '' && mb_strlen($a) > 20) { $pairs[] = ['question' => $q, 'answer' => mb_substr($a, 0, 1000)]; }
+            }
+        }
+        return array_slice(array_values(array_unique($pairs, SORT_REGULAR)), 0, 12);
+    }
+
+    private function extractVideos(string $html, string $url): array
+    {
+        $videos = [];
+        if (preg_match_all('/<iframe[^>]+src=["\']([^"\']*(youtube\.com|youtu\.be|vimeo\.com)[^"\']*)["\'][^>]*>/isu', $html, $m, PREG_SET_ORDER)) {
+            foreach ($m as $row) { $videos[] = ['embedUrl' => Security::absUrl(html_entity_decode($row[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'), $url)]; }
+        }
+        if (preg_match_all('/<video[^>]+src=["\']([^"\']+)["\'][^>]*>/isu', $html, $m, PREG_SET_ORDER)) {
+            foreach ($m as $row) { $videos[] = ['contentUrl' => Security::absUrl(html_entity_decode($row[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'), $url)]; }
+        }
+        return array_slice($videos, 0, 10);
+    }
+
+    private function extractImages(string $html, string $url): array
+    {
+        $images = [];
+        $dom = $this->dom($html);
+        if ($dom) {
+            foreach ($dom->getElementsByTagName('img') as $img) {
+                $srcs = [];
+                foreach (['data-src','data-lazy-src','data-original','src'] as $attr) {
+                    if ($img->hasAttribute($attr)) { $srcs[] = $img->getAttribute($attr); }
+                }
+                foreach ($srcs as $src) {
+                    $src = html_entity_decode(trim($src), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                    if ($this->isUsableImage($src)) { $images[] = Security::absUrl($src, $url); break; }
+                }
+            }
+        } elseif (preg_match_all('/<img\b[^>]*>/isu', $html, $tags)) {
+            foreach ($tags[0] as $tag) {
+                foreach (['data-src','data-lazy-src','data-original','src'] as $attr) {
+                    if (preg_match('/\b'.$attr.'=["\']([^"\']+)["\']/isu', $tag, $m)) {
+                        $src = html_entity_decode(trim($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                        if ($this->isUsableImage($src)) { $images[] = Security::absUrl($src, $url); break; }
+                    }
+                }
+            }
+        }
+        return array_values(array_unique(array_slice($images, 0, 30)));
+    }
+
+    private function primaryImage(array $images, string $html, string $url): string
+    {
+        foreach ($images as $image) {
+            if (!$this->isLogoOrCounter($image)) { return $image; }
+        }
+        $og = $this->extractMeta($html, 'og:image', true);
+        return $og ? Security::absUrl($og, $url) : ($images[0] ?? '');
+    }
+
+
+    private function shouldExtractProductSignals(string $html, string $url, array $jsonLd): bool
+    {
+        foreach ($jsonLd as $schema) {
+            if (in_array('Product', $this->flattenTypes($schema), true) || in_array('ProductGroup', $this->flattenTypes($schema), true)) {
+                return true;
+            }
+        }
+        if (preg_match('/itemtype=["\']https?:\/\/schema\.org\/(Product|ProductGroup)["\']/isu', $html)) {
+            return true;
+        }
+        $path = parse_url(Security::normalizeUrl($url), PHP_URL_PATH) ?: '';
+        if (!preg_match('~/(catalog|product|products|shop)/~i', $path)) {
+            return false;
+        }
+        $text = mb_strtolower(Security::text($html, 30000));
+        return strpos($text, 'артикул') !== false || strpos($text, 'sku') !== false || strpos($text, 'isbn') !== false;
+    }
+
+    private function emptyProductSignals(string $url): array
+    {
+        return [
+            'name' => '',
+            'sku' => '',
+            'brand' => '',
+            'price' => '',
+            'priceCurrency' => '',
+            'availability' => '',
+            'url' => Security::normalizeUrl($url),
+            'image' => '',
+        ];
+    }
+
+    private function emptyMicrodataProductSignals(): array
+    {
+        return [
+            'found' => false,
+            'type' => '',
+            'name' => '',
+            'description' => '',
+            'brand' => '',
+            'image' => '',
+            'offers' => [],
+            'missing_yandex_fields' => [],
+        ];
+    }
+
+    private function extractReviews(string $html, string $url): array
+    {
+        $dom = $this->dom($html);
+        if (!$dom) { return []; }
+        $xp = new \DOMXPath($dom);
+        $nodes = $xp->query('//*[contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "review") or contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ","abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщъыьэюя"), "отзыв")]');
+        $reviews = [];
+        if ($nodes) {
+            foreach ($nodes as $node) {
+                if (!$node instanceof \DOMElement) { continue; }
+                $text = $this->normalizeItemName($node->textContent);
+                if (mb_strlen($text) < 40) { continue; }
+                if (preg_match('/(все отзывы|оставить отзыв|отзывы о нас)/iu', $text)) { continue; }
+                $author = '';
+                $authorNode = $xp->query('.//*[contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "author") or contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ","abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщъыьэюя"), "автор") or contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ","abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщъыьэюя"), "имя")]', $node)->item(0);
+                if ($authorNode) { $author = $this->normalizeItemName($authorNode->textContent); }
+                $rating = '';
+                if (preg_match('/([1-5](?:[\.,]\d)?)\s*(?:\/\s*5|из\s*5|★|зв)/iu', $text, $m)) { $rating = str_replace(',', '.', $m[1]); }
+                $reviews[] = [
+                    'reviewBody' => mb_substr($text, 0, 1000),
+                    'author' => mb_substr($author, 0, 100),
+                    'ratingValue' => $rating,
+                ];
+                if (count($reviews) >= 10) { break; }
+            }
+        }
+        return array_values(array_unique($reviews, SORT_REGULAR));
+    }
+
+    private function extractProductSignals(string $html, string $url, array $jsonLd = []): array
+    {
+        $fromDom = $this->productFromDom($html, $url);
+        $fromJson = $this->productFromJsonLd($jsonLd, $url);
+        $product = $fromJson ?: $fromDom;
+        foreach ($fromDom as $key => $value) {
+            if (($product[$key] ?? '') === '' && $value !== '') { $product[$key] = $value; }
+        }
+        if (($product['brand'] ?? '') === '' && Options::get('product_brand_fallback', 'organization') === 'organization') {
+            $fallbackBrand = Options::get('organization_name') ?: Options::get('site_name');
+            if ($fallbackBrand !== '') { $product['brand'] = $this->cleanProductValue($fallbackBrand); }
+        }
+        return $product;
+    }
+
+    private function productFromDom(string $html, string $url): array
+    {
+        $plain = Security::text($html, 70000);
+        $props = $this->extractProductProperties($html);
+        $price = '';
+        $currency = '';
+        if (preg_match('/<meta[^>]+itemprop=["\']price["\'][^>]+content=["\']([^"\']+)["\']/isu', $html, $m) || preg_match('/<meta[^>]+content=["\']([^"\']+)["\'][^>]+itemprop=["\']price["\']/isu', $html, $m)) {
+            $price = str_replace(',', '.', preg_replace('/\s+/u', '', html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8')));
+            $currency = 'RUB';
+        }
+        if ($price === '' && (preg_match('/(?:price|цена|стоимость)[^0-9]{0,40}([0-9][0-9\s.,]*)\s*(₽|руб\.?|RUB)/iu', $plain, $m) || preg_match('/([0-9][0-9\s.,]*)\s*(₽|руб\.?|RUB)/iu', $plain, $m))) {
+            $price = str_replace(',', '.', preg_replace('/\s+/u', '', $m[1]));
+            $currency = 'RUB';
+        }
+        if (preg_match('/<meta[^>]+itemprop=["\']priceCurrency["\'][^>]+content=["\']([^"\']+)["\']/isu', $html, $m) || preg_match('/<meta[^>]+content=["\']([^"\']+)["\'][^>]+itemprop=["\']priceCurrency["\']/isu', $html, $m)) {
+            $currency = strtoupper(trim(html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8')));
+        }
+        $sku = '';
+        foreach (['Артикул','SKU','ISBN','Код товара'] as $key) {
+            if (!empty($props[$key])) { $sku = $this->cleanProductValue($props[$key]); break; }
+        }
+        if ($sku === '' && preg_match('/(?:арт\.?|артикул|sku|isbn)\s*[:№#.-]?\s*([A-Za-zА-Яа-я0-9._\-\/]{2,80})/iu', $plain, $m)) { $sku = preg_match('/\d/', $m[1]) ? $this->cleanProductValue($m[1]) : ''; }
+        $brand = '';
+        foreach (['Бренд','Brand','Производитель','Издательство','Издатель','Publisher'] as $key) {
+            if (!empty($props[$key])) { $brand = $this->cleanProductValue($props[$key]); break; }
+        }
+        if ($brand === '' && preg_match('/(?:бренд|brand|производитель|издательство|издатель|publisher)\s*[:：]\s*([A-Za-zА-Яа-я0-9 ._\-]{2,80})/iu', $plain, $m)) { $brand = $this->cleanProductValue($m[1]); }
+        $availability = '';
+        if (preg_match('/itemprop=["\']availability["\'][^>]+(?:href|content)=["\']([^"\']+)["\']/isu', $html, $m) || preg_match('/(?:href|content)=["\']([^"\']+)["\'][^>]+itemprop=["\']availability["\']/isu', $html, $m)) {
+            $availability = $this->normalizeAvailability(html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        }
+        if ($availability === '' && preg_match('/\b(в наличии|есть в наличии)\b/iu', $plain)) { $availability = 'https://schema.org/InStock'; }
+        elseif ($availability === '' && preg_match('/\b(нет в наличии|под заказ|ожидается)\b/iu', $plain)) { $availability = 'https://schema.org/OutOfStock'; }
+        return [
+            'name' => ($this->extractHeadings($html, 'h1')[0] ?? $this->extractTitle($html)),
+            'sku' => $sku,
+            'brand' => $brand,
+            'price' => $price,
+            'priceCurrency' => $currency,
+            'availability' => $availability,
+            'url' => $this->extractCanonical($html, $url),
+            'image' => $this->extractMeta($html, 'og:image', true) ?: ($this->primaryImage($this->extractImages($html, $url), $html, $url)),
+        ];
+    }
+
+    private function extractProductProperties(string $html): array
+    {
+        $props = [];
+        $dom = $this->dom($html);
+        if (!$dom) { return $props; }
+        $xp = new \DOMXPath($dom);
+        $nodes = $xp->query('//*[contains(concat(" ", normalize-space(@class), " "), " properties__item ")]');
+        foreach ($nodes as $node) {
+            $titleNode = $xp->query('.//*[contains(concat(" ", normalize-space(@class), " "), " js-prop-title ")]', $node)->item(0);
+            $valueNode = $xp->query('.//*[contains(concat(" ", normalize-space(@class), " "), " js-prop-value ")]', $node)->item(0);
+            if (!$titleNode || !$valueNode) { continue; }
+            $title = $this->normalizeItemName($titleNode->textContent);
+            $value = $this->normalizeItemName($valueNode->textContent);
+            if ($title !== '' && $value !== '') { $props[$title] = $value; }
+        }
+        return $props;
+    }
+
+    private function extractMicrodataProductSignals(string $html, string $url): array
+    {
+        $empty = ['found' => false, 'type' => '', 'name' => '', 'description' => '', 'brand' => '', 'image' => '', 'offers' => [], 'missing_yandex_fields' => []];
+        $dom = $this->dom($html);
+        if (!$dom) { return $this->extractMicrodataProductSignalsRegex($html); }
+        $xp = new \DOMXPath($dom);
+        $nodes = $xp->query('//*[contains(translate(@itemtype,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "schema.org/product")]');
+        if (!$nodes || !$nodes->length) { return $empty; }
+        $node = $nodes->item(0);
+        $type = preg_match("~schema\\.org/([^\"'\\s>]+)~i", $node->getAttribute('itemtype'), $m) ? $m[1] : 'Product';
+        $getProp = function (string $prop) use ($xp, $node): string {
+            $attr = $xp->query('.//*[@itemprop="'.$prop.'"]/@content | .//*[@itemprop="'.$prop.'"]/@href | .//*[@itemprop="'.$prop.'"]/@src', $node)->item(0);
+            if ($attr) { return trim(html_entity_decode((string)$attr->nodeValue, ENT_QUOTES | ENT_HTML5, 'UTF-8')); }
+            $el = $xp->query('.//*[@itemprop="'.$prop.'"]', $node)->item(0);
+            return $el ? $this->normalizeItemName($el->textContent) : '';
+        };
+        $brand = $getProp('brand');
+        $offers = [];
+        $offerNodes = $xp->query('.//*[@itemprop="offers" and contains(translate(@itemtype,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "schema.org/offer")]', $node);
+        foreach ($offerNodes as $offerNode) {
+            $offerGet = function (string $prop) use ($xp, $offerNode): string {
+                $attr = $xp->query('.//*[@itemprop="'.$prop.'"]/@content | .//*[@itemprop="'.$prop.'"]/@href | .//*[@itemprop="'.$prop.'"]/@src', $offerNode)->item(0);
+                if ($attr) { return trim(html_entity_decode((string)$attr->nodeValue, ENT_QUOTES | ENT_HTML5, 'UTF-8')); }
+                $el = $xp->query('.//*[@itemprop="'.$prop.'"]', $offerNode)->item(0);
+                return $el ? $this->normalizeItemName($el->textContent) : '';
+            };
+            $offers[] = ['type' => preg_match('~AggregateOffer~i', $offerNode->getAttribute('itemtype')) ? 'AggregateOffer' : 'Offer', 'price' => $offerGet('price'), 'lowPrice' => $offerGet('lowPrice'), 'priceCurrency' => $offerGet('priceCurrency'), 'availability' => $offerGet('availability')];
+        }
+        $missing = [];
+        $name = $getProp('name');
+        $image = $getProp('image');
+        if ($name === '') { $missing[] = 'Product.name'; }
+        if ($brand === '') { $missing[] = 'Product.brand'; }
+        if ($image === '') { $missing[] = 'Product.image'; }
+        if (!$offers) { $missing[] = 'Product.offers'; }
+        foreach ($offers as $offer) {
+            if (($offer['price'] ?? '') === '' && ($offer['lowPrice'] ?? '') === '') { $missing[] = 'Offer.price_or_lowPrice'; }
+            if (($offer['priceCurrency'] ?? '') === '') { $missing[] = 'Offer.priceCurrency'; }
+            if (($offer['availability'] ?? '') === '') { $missing[] = 'Offer.availability'; }
+        }
+        return ['found' => true, 'type' => $type, 'name' => $name, 'description' => $getProp('description'), 'brand' => $brand, 'image' => $image, 'offers' => $offers, 'missing_yandex_fields' => array_values(array_unique($missing))];
+    }
+
+    private function extractMicrodataProductSignalsRegex(string $html): array
+    {
+        $empty = ['found' => false, 'type' => '', 'name' => '', 'description' => '', 'brand' => '', 'image' => '', 'offers' => [], 'missing_yandex_fields' => []];
+        if (!preg_match('/itemtype=["\']https?:\/\/schema\.org\/(Product|ProductGroup)["\']/isu', $html, $typeMatch)) { return $empty; }
+        $get = static function (string $prop) use ($html): string {
+            if (preg_match('/<meta[^>]+itemprop=["\']'.preg_quote($prop, '/').'["\'][^>]+content=["\']([^"\']+)["\']/isu', $html, $m) || preg_match('/<meta[^>]+content=["\']([^"\']+)["\'][^>]+itemprop=["\']'.preg_quote($prop, '/').'["\']/isu', $html, $m)) {
+                return trim(html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            }
+            if (preg_match('/<(?:img|source)[^>]+itemprop=["\']'.preg_quote($prop, '/').'["\'][^>]+(?:src|data-src|content)=["\']([^"\']+)["\']/isu', $html, $m) || preg_match('/<(?:img|source)[^>]+(?:src|data-src|content)=["\']([^"\']+)["\'][^>]+itemprop=["\']'.preg_quote($prop, '/').'["\']/isu', $html, $m)) {
+                return trim(html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+            }
+            if (preg_match('/<[^>]+itemprop=["\']'.preg_quote($prop, '/').'["\'][^>]*>(.*?)<\/[^>]+>/isu', $html, $m)) {
+                return trim(preg_replace('/\s+/u', ' ', html_entity_decode(strip_tags($m[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8')) ?: '');
+            }
+            return '';
+        };
+        $offerFound = preg_match('/itemprop=["\']offers["\'][^>]+itemtype=["\']https?:\/\/schema\.org\/(Offer|AggregateOffer)["\']/isu', $html) || preg_match('/itemtype=["\']https?:\/\/schema\.org\/(Offer|AggregateOffer)["\'][^>]+itemprop=["\']offers["\']/isu', $html);
+        $offer = ['type' => 'Offer', 'price' => $get('price'), 'lowPrice' => $get('lowPrice'), 'priceCurrency' => $get('priceCurrency'), 'availability' => $get('availability')];
+        $offers = $offerFound ? [$offer] : [];
+        $missing = [];
+        $name = $get('name');
+        $brand = $get('brand');
+        $image = $get('image');
+        if ($name === '') { $missing[] = 'Product.name'; }
+        if ($brand === '') { $missing[] = 'Product.brand'; }
+        if ($image === '') { $missing[] = 'Product.image'; }
+        if (!$offers) { $missing[] = 'Product.offers'; }
+        foreach ($offers as $of) {
+            if (($of['price'] ?? '') === '' && ($of['lowPrice'] ?? '') === '') { $missing[] = 'Offer.price_or_lowPrice'; }
+            if (($of['priceCurrency'] ?? '') === '') { $missing[] = 'Offer.priceCurrency'; }
+            if (($of['availability'] ?? '') === '') { $missing[] = 'Offer.availability'; }
+        }
+        return ['found' => true, 'type' => $typeMatch[1], 'name' => $name, 'description' => $get('description'), 'brand' => $brand, 'image' => $image, 'offers' => $offers, 'missing_yandex_fields' => array_values(array_unique($missing))];
+    }
+
+    private function extractListItems(string $html, string $url, array $jsonLd = []): array
+    {
+        $path = parse_url(Security::normalizeUrl($url), PHP_URL_PATH) ?: '';
+        if (preg_match('~^/blog/?~i', $path)) {
+            $items = $this->blogItemsFromJsonLd($jsonLd, $url);
+            if ($items) { return array_slice($items, 0, 30); }
+            return $this->blogItemsFromDom($html, $url);
+        }
+        if (preg_match('~^/catalog/?~i', $path)) {
+            $catalogItems = $this->catalogItemsFromDom($html, $url);
+            if (count($catalogItems) > 1) { return $catalogItems; }
+            return [];
+        }
+        return $this->genericListItems($html, $url);
+    }
+
+    private function extractDates(string $html): array
+    {
+        $dates = [];
+        if (preg_match_all('/<time[^>]+datetime=["\']([^"\']+)["\'][^>]*>/isu', $html, $m)) {
+            foreach ($m[1] as $d) { $dates[] = $d; }
+        }
+        foreach (['article:published_time','article:modified_time'] as $prop) {
+            $v = $this->extractMeta($html, $prop, true);
+            if ($v !== '') { $dates[] = $v; }
+        }
+        $plain = Security::text($html, 90000);
+        $months = 'января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря';
+        if (preg_match_all('/\b(\d{1,2})\s+('.$months.')\s+(20\d{2})\b/iu', $plain, $m, PREG_SET_ORDER)) {
+            foreach ($m as $row) {
+                $iso = $this->ruDateToIso((int)$row[1], mb_strtolower($row[2]), (int)$row[3]);
+                if ($iso) { $dates[] = $iso; }
+            }
+        }
+        return array_values(array_unique(array_slice($dates, 0, 5)));
+    }
+
+    private function productFromJsonLd(array $schemas, string $url): array
+    {
+        foreach ($schemas as $schema) {
+            foreach ($this->findNodesByType($schema, ['Product','ProductGroup']) as $node) {
+                $offer = [];
+                if (!empty($node['offers']) && is_array($node['offers'])) {
+                    $offers = array_keys($node['offers']) === range(0, count($node['offers']) - 1) ? $node['offers'] : [$node['offers']];
+                    $offer = is_array($offers[0] ?? null) ? $offers[0] : [];
+                }
+                $image = $node['image'] ?? '';
+                if (is_array($image)) { $image = $image[0] ?? ''; }
+                $brand = $node['brand'] ?? '';
+                if (is_array($brand)) { $brand = $brand['name'] ?? ''; }
+                return [
+                    'name' => (string)($node['name'] ?? ''),
+                    'sku' => $this->cleanProductValue((string)($node['sku'] ?? '')),
+                    'brand' => $this->cleanProductValue((string)$brand),
+                    'price' => (string)($offer['price'] ?? ''),
+                    'priceCurrency' => (string)($offer['priceCurrency'] ?? ''),
+                    'availability' => $this->normalizeAvailability((string)($offer['availability'] ?? '')),
+                    'url' => (string)($node['url'] ?? $url),
+                    'image' => (string)$image,
+                ];
+            }
+        }
+        return [];
+    }
+
+    private function blogItemsFromJsonLd(array $schemas, string $url): array
+    {
+        $items = [];
+        foreach ($schemas as $schema) {
+            foreach ($this->findNodesByType($schema, ['Blog']) as $blog) {
+                foreach ((array)($blog['blogPost'] ?? []) as $post) {
+                    if (!is_array($post)) { continue; }
+                    $name = $this->normalizeItemName((string)($post['headline'] ?? $post['name'] ?? ''));
+                    $href = (string)($post['url'] ?? '');
+                    if ($name !== '' && $href !== '') { $items[] = ['name' => $name, 'url' => Security::absUrl($href, $url)]; }
+                }
+            }
+        }
+        return array_values(array_unique($items, SORT_REGULAR));
+    }
+
+    private function blogItemsFromDom(string $html, string $url): array
+    {
+        $items = [];
+        $dom = $this->dom($html);
+        if (!$dom) { return $this->genericListItems($html, $url); }
+        $xp = new \DOMXPath($dom);
+        $links = $xp->query('//a[@href]');
+        foreach ($links as $a) {
+            $href = $a->getAttribute('href');
+            $path = parse_url(Security::absUrl($href, $url), PHP_URL_PATH) ?: '';
+            if (!preg_match('~^/blog/[^/]+/[^/]+/?$~i', $path)) { continue; }
+            $name = $this->normalizeItemName($a->textContent);
+            if ($name !== '') { $items[] = ['name' => $name, 'url' => Security::absUrl($href, $url)]; }
+        }
+        return array_slice(array_values(array_unique($items, SORT_REGULAR)), 0, 30);
+    }
+
+    private function catalogItemsFromDom(string $html, string $url): array
+    {
+        $items = [];
+        $dom = $this->dom($html);
+        if (!$dom) { return $this->catalogItemsFromRegex($html, $url); }
+        $xp = new \DOMXPath($dom);
+        $productNodes = $xp->query('//*[contains(translate(@itemtype,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "schema.org/product")]');
+        foreach ($productNodes as $node) {
+            $name = '';
+            $meta = $xp->query('.//meta[@itemprop="description" or @itemprop="name"]/@content', $node)->item(0);
+            if ($meta) { $name = $this->normalizeItemName($meta->nodeValue); }
+            if ($name === '') {
+                $linkName = $xp->query('.//a[@href and string-length(normalize-space(.)) > 3]', $node)->item(0);
+                if ($linkName) { $name = $this->normalizeItemName($linkName->textContent); }
+            }
+            if ($name === '') {
+                $imgAlt = $xp->query('.//img[@alt]/@alt', $node)->item(0);
+                if ($imgAlt) { $name = $this->normalizeItemName($imgAlt->nodeValue); }
+            }
+            $href = '';
+            $links = $xp->query('.//a[@href]', $node);
+            foreach ($links as $a) {
+                $candidate = (string)$a->getAttribute('href');
+                $abs = Security::absUrl($candidate, $url);
+                $path = parse_url($abs, PHP_URL_PATH) ?: '';
+                if ($this->isCatalogProductUrl($path, $url)) { $href = $abs; break; }
+            }
+            if ($name !== '' && $href !== '') { $items[] = ['name' => $name, 'url' => $href]; }
+        }
+        return array_slice(array_values(array_unique($items, SORT_REGULAR)), 0, 30);
+    }
+
+    private function catalogItemsFromRegex(string $html, string $url): array
+    {
+        $items = [];
+        if (!preg_match_all('/<div[^>]+class=["\'][^"\']*catalog-block__item[^"\']*["\'][^>]*>(.*?)(?=<div[^>]+class=["\'][^"\']*catalog-block__item|<\/body>|$)/isu', $html, $blocks)) {
+            return [];
+        }
+        foreach ($blocks[1] as $block) {
+            $name = '';
+            if (preg_match('/<meta[^>]+content=["\']([^"\']+)["\'][^>]+itemprop=["\'](?:description|name)["\']/isu', $block, $m) || preg_match('/<meta[^>]+itemprop=["\'](?:description|name)["\'][^>]+content=["\']([^"\']+)["\']/isu', $block, $m)) {
+                $name = $this->normalizeItemName($m[1]);
+            }
+            $href = '';
+            if (preg_match_all('/<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)<\/a>/isu', $block, $links, PREG_SET_ORDER)) {
+                foreach ($links as $a) {
+                    $abs = Security::absUrl(html_entity_decode($a[1], ENT_QUOTES | ENT_HTML5, 'UTF-8'), $url);
+                    $path = parse_url($abs, PHP_URL_PATH) ?: '';
+                    if (!$this->isCatalogProductUrl($path, $url)) { continue; }
+                    $href = $abs;
+                    if ($name === '') { $name = $this->normalizeItemName($a[2]); }
+                    break;
+                }
+            }
+            if ($name === '' && preg_match('/<img[^>]+alt=["\']([^"\']+)["\']/isu', $block, $im)) {
+                $name = $this->normalizeItemName($im[1]);
+            }
+            if ($name !== '' && $href !== '') { $items[] = ['name' => $name, 'url' => $href]; }
+        }
+        return array_slice(array_values(array_unique($items, SORT_REGULAR)), 0, 30);
+    }
+
+    private function genericListItems(string $html, string $url): array
+    {
+        $items = [];
+        if (preg_match_all('/<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)<\/a>/isu', $html, $m, PREG_SET_ORDER)) {
+            foreach ($m as $a) {
+                $name = $this->normalizeItemName($a[2]);
+                $href = Security::absUrl($a[1], $url);
+                if ($name !== '' && !$this->isNoiseUrl($href)) { $items[] = ['name' => $name, 'url' => $href]; }
+            }
+        }
+        return array_slice(array_values(array_unique($items, SORT_REGULAR)), 0, 30);
+    }
+
+    private function findNodesByType($node, array $types): array
+    {
+        if (!is_array($node)) { return []; }
+        $found = [];
+        $nodeTypes = array_map('strval', (array)($node['@type'] ?? []));
+        foreach ($nodeTypes as $nodeType) {
+            if (in_array($nodeType, $types, true)) { $found[] = $node; break; }
+        }
+        foreach ($node as $value) {
+            if (is_array($value)) {
+                if (array_keys($value) === range(0, count($value) - 1)) {
+                    foreach ($value as $child) { $found = array_merge($found, $this->findNodesByType($child, $types)); }
+                } else {
+                    $found = array_merge($found, $this->findNodesByType($value, $types));
+                }
+            }
+        }
+        return $found;
+    }
+
+    private function dom(string $html): ?\DOMDocument
+    {
+        if (!class_exists('DOMDocument')) { return null; }
+        $dom = new \DOMDocument('1.0', 'UTF-8');
+        $old = libxml_use_internal_errors(true);
+        $encoded = '<?xml encoding="utf-8" ?>' . $html;
+        $ok = $dom->loadHTML($encoded, LIBXML_NOWARNING | LIBXML_NOERROR | LIBXML_NONET | LIBXML_COMPACT);
+        libxml_clear_errors();
+        libxml_use_internal_errors($old);
+        return $ok ? $dom : null;
+    }
+
+    private function isCatalogProductUrl(string $path, string $currentUrl): bool
+    {
+        $current = parse_url(Security::normalizeUrl($currentUrl), PHP_URL_PATH) ?: '';
+        if (!preg_match('~^/catalog/.+/$~i', $path)) { return false; }
+        if (strpos($path, '/filter/') !== false || strpos($path, '/apply/') !== false) { return false; }
+        if (rtrim($path, '/') === rtrim($current, '/')) { return false; }
+        return substr_count(trim($path, '/'), '/') >= 2;
+    }
+
+    private function isNoiseUrl(string $href): bool
+    {
+        return preg_match('~/(bitrix/admin|personal|basket|favorite|search/|auth|login|logout)|^(tel:|mailto:)~i', $href) === 1;
+    }
+
+    private function isUsableImage(string $src): bool
+    {
+        if ($src === '' || strpos($src, 'data:') === 0) { return false; }
+        if (strpos($src, 'mc.yandex.ru/watch') !== false) { return false; }
+        return true;
+    }
+
+    private function isLogoOrCounter(string $src): bool
+    {
+        $s = mb_strtolower($src);
+        return strpos($s, 'logo') !== false || strpos($s, '/cpremier/') !== false || strpos($s, 'mc.yandex') !== false || strpos($s, 'favicon') !== false;
+    }
+
+    private function normalizeAvailability(string $value): string
+    {
+        $value = trim($value);
+        if ($value === '') { return ''; }
+        if (preg_match('~^https?://~i', $value)) { return $value; }
+        if (preg_match('/^(InStock|OutOfStock|PreOrder|PreSale|BackOrder|Discontinued|LimitedAvailability|OnlineOnly|SoldOut)$/i', $value, $m)) {
+            return 'https://schema.org/' . $m[1];
+        }
+        return $value;
+    }
+
+    private function cleanProductValue(string $value): string
+    {
+        $value = $this->normalizeItemName($value);
+        if ($value === '') { return ''; }
+        if (preg_match('/^[a-z0-9_-]*__[a-z0-9_-]+$/i', $value)) { return ''; }
+        if (preg_match('/^(s-list|props__item|item|value|name|price|brand)$/i', $value)) { return ''; }
+        return mb_substr($value, 0, 120);
+    }
+
+    private function normalizeItemName(string $value): string
+    {
+        $value = $this->cleanText($value);
+        $value = preg_replace('/\s+/u', ' ', $value) ?: '';
+        $value = trim($value, " \t\n\r\0\x0B·›»/");
+        if ($value === '' || mb_strlen($value) > 200) { return ''; }
+        if (preg_match('/^(0|войти|кабинет|корзина|избранное|меню|сайт|администрирование)$/iu', $value)) { return ''; }
+        return $value;
+    }
+
+    private function cleanText(string $html): string
+    {
+        $text = html_entity_decode(strip_tags($html), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $text = preg_replace('/\s+/u', ' ', $text) ?: '';
+        return trim($text);
+    }
+
+    private function ruDateToIso(int $day, string $month, int $year): string
+    {
+        $map = [
+            'января' => 1, 'февраля' => 2, 'марта' => 3, 'апреля' => 4, 'мая' => 5, 'июня' => 6,
+            'июля' => 7, 'августа' => 8, 'сентября' => 9, 'октября' => 10, 'ноября' => 11, 'декабря' => 12,
+        ];
+        $m = $map[$month] ?? 0;
+        if ($m < 1 || !checkdate($m, $day, $year)) { return ''; }
+        return sprintf('%04d-%02d-%02d', $year, $m, $day);
+    }
+
+    private function countWords(string $text): int
+    {
+        preg_match_all('/[\p{L}\p{N}]{2,}/u', $text, $m);
+        return count($m[0] ?? []);
+    }
+}
