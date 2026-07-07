@@ -237,6 +237,26 @@ class Db
         return $rows;
     }
 
+    // Дешёвая проверка: есть ли для этой страницы подтверждённые «страничные» предложения
+    // (точный URL или один из возможных для этого пути page_kind). Позволяет пропустить дорогой
+    // разбор HTML на страницах, где нужно вывести только sitewide-блок из готового JSON.
+    public static function hasRequestProposals(array $pageKinds, string $url): bool
+    {
+        self::install();
+        $connection = Application::getConnection();
+        $helper = $connection->getSqlHelper();
+        $normalized = Security::normalizeUrl($url);
+        $path = self::urlPath($normalized);
+        $conds = ["(URL_MATCH_MODE='exact_url' AND (SAMPLE_PATH='" . $helper->forSql($path) . "' OR SAMPLE_URL='" . $helper->forSql($normalized) . "'))"];
+        $pageKinds = array_values(array_filter(array_map('strval', $pageKinds)));
+        if ($pageKinds) {
+            $escaped = array_map(static fn($k) => "'" . $helper->forSql($k) . "'", $pageKinds);
+            $conds[] = "((URL_MATCH_MODE='' OR URL_MATCH_MODE='page_kind' OR URL_MATCH_MODE='template') AND PAGE_KIND IN (" . implode(',', $escaped) . "))";
+        }
+        $sql = "SELECT 1 FROM " . self::PROPOSALS . " WHERE STATUS IN ('applied','approved') AND (" . implode(' OR ', $conds) . ") LIMIT 1";
+        return (bool)$connection->query($sql)->fetch();
+    }
+
     public static function activeForRequest(string $kind, string $url): array
     {
         self::install();

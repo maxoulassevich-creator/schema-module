@@ -434,19 +434,33 @@ class HtmlAnalyzer
         $dom = $this->dom($html);
         if (!$dom) { return []; }
         $xp = new \DOMXPath($dom);
-        $nodes = $xp->query('//*[contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "review") or contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ","abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщъыьэюя"), "отзыв")]');
+        $reviewPredicate = 'contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "review") or contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ","abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщъыьэюя"), "отзыв")';
+        $nodes = $xp->query('//*[' . $reviewPredicate . ']');
         $reviews = [];
         if ($nodes) {
             foreach ($nodes as $node) {
                 if (!$node instanceof \DOMElement) { continue; }
+                // Пропускаем контейнеры-обёртки: если внутри есть другой review-элемент, значит это
+                // список/блок отзывов, а сам отзыв — вложенный элемент (его и возьмём отдельно).
+                if ($xp->query('.//*[' . $reviewPredicate . ']', $node)->length > 0) { continue; }
                 $text = $this->normalizeItemName($node->textContent);
                 if (mb_strlen($text) < 40) { continue; }
                 if (preg_match('/(все отзывы|оставить отзыв|отзывы о нас)/iu', $text)) { continue; }
                 $author = '';
-                $authorNode = $xp->query('.//*[contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "author") or contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ","abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщъыьэюя"), "автор") or contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ","abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщъыьэюя"), "имя")]', $node)->item(0);
+                $authorNode = $xp->query('.//*[@itemprop="author"]', $node)->item(0)
+                    ?: $xp->query('.//*[contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"), "author") or contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ","abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщъыьэюя"), "автор") or contains(translate(@class,"ABCDEFGHIJKLMNOPQRSTUVWXYZАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ","abcdefghijklmnopqrstuvwxyzабвгдеёжзийклмнопрстуфхцчшщъыьэюя"), "имя")]', $node)->item(0);
                 if ($authorNode) { $author = $this->normalizeItemName($authorNode->textContent); }
                 $rating = '';
                 if (preg_match('/([1-5](?:[\.,]\d)?)\s*(?:\/\s*5|из\s*5|★|зв)/iu', $text, $m)) { $rating = str_replace(',', '.', $m[1]); }
+                // Отзыв должен иметь признак отзыва: автора, оценку или явную разметку review.
+                // Иначе легко захватить обычный текстовый блок (например, ответ из FAQ).
+                $isReview = $author !== '' || $rating !== '';
+                if (!$isReview) {
+                    $itemtype = mb_strtolower($node->getAttribute('itemtype'));
+                    $isReview = strpos($itemtype, 'schema.org/review') !== false
+                        || $xp->query('.//*[@itemprop="reviewBody" or @itemprop="author" or @itemprop="reviewRating" or @itemprop="ratingValue"]', $node)->length > 0;
+                }
+                if (!$isReview) { continue; }
                 $reviews[] = [
                     'reviewBody' => mb_substr($text, 0, 1000),
                     'author' => mb_substr($author, 0, 100),
@@ -776,15 +790,66 @@ class HtmlAnalyzer
 
     private function genericListItems(string $html, string $url): array
     {
+        $dom = $this->dom($html);
+        if (!$dom) { return $this->genericListItemsRegex($html, $url); }
+        $xp = new \DOMXPath($dom);
+        $items = [];
+        $seen = [];
+        foreach ($xp->query('//a[@href]') as $a) {
+            if (!$a instanceof \DOMElement) { continue; }
+            $raw = trim($a->getAttribute('href'));
+            if ($this->isNoiseHref($raw) || $this->insideChrome($a)) { continue; }
+            $name = $this->normalizeItemName($a->textContent);
+            if ($name === '') { continue; }
+            $href = Security::absUrl(html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'), $url);
+            if ($href === '' || $this->isNoiseUrl($href)) { continue; }
+            $key = mb_strtolower($name . '|' . $href);
+            if (isset($seen[$key])) { continue; }
+            $seen[$key] = true;
+            $items[] = ['name' => $name, 'url' => $href];
+            if (count($items) >= 30) { break; }
+        }
+        return $items;
+    }
+
+    private function genericListItemsRegex(string $html, string $url): array
+    {
         $items = [];
         if (preg_match_all('/<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)<\/a>/isu', $html, $m, PREG_SET_ORDER)) {
             foreach ($m as $a) {
+                $raw = trim($a[1]);
+                if ($this->isNoiseHref($raw)) { continue; }
                 $name = $this->normalizeItemName($a[2]);
-                $href = Security::absUrl($a[1], $url);
-                if ($name !== '' && !$this->isNoiseUrl($href)) { $items[] = ['name' => $name, 'url' => $href]; }
+                $href = Security::absUrl(html_entity_decode($raw, ENT_QUOTES | ENT_HTML5, 'UTF-8'), $url);
+                if ($name !== '' && $href !== '' && !$this->isNoiseUrl($href)) { $items[] = ['name' => $name, 'url' => $href]; }
             }
         }
         return array_slice(array_values(array_unique($items, SORT_REGULAR)), 0, 30);
+    }
+
+    // Ссылки шапки/меню/подвала/сайдбара — это навигация сайта, а не элементы списка на странице.
+    private function insideChrome(\DOMElement $node): bool
+    {
+        $chromeTags = ['header' => 1, 'nav' => 1, 'footer' => 1, 'aside' => 1];
+        $p = $node->parentNode;
+        $hops = 0;
+        while ($p instanceof \DOMElement && $hops++ < 25) {
+            if (isset($chromeTags[strtolower($p->nodeName)])) { return true; }
+            $role = strtolower($p->getAttribute('role'));
+            if ($role === 'navigation' || $role === 'banner' || $role === 'contentinfo') { return true; }
+            $token = ' ' . mb_strtolower($p->getAttribute('class') . ' ' . $p->getAttribute('id')) . ' ';
+            if (preg_match('~(^|[\s_-])(menu|nav|navbar|header|footer|breadcrumb|sidebar|side-bar|submenu|dropdown|socials?|basket|cart|compare|wishlist|top-panel|top_block|bottom_block)~u', $token)) {
+                return true;
+            }
+            $p = $p->parentNode;
+        }
+        return false;
+    }
+
+    private function isNoiseHref(string $raw): bool
+    {
+        if ($raw === '' || $raw === '#') { return true; }
+        return (bool)preg_match('~^(#|tel:|mailto:|callto:|skype:|whatsapp:|viber:|javascript:|data:)~i', $raw);
     }
 
     private function findNodesByType($node, array $types): array

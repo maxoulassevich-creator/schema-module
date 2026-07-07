@@ -17,12 +17,19 @@ class Output
         if (Options::get('output_enabled', 'Y') !== 'Y') { return; }
         if ($this->shouldSkip($content)) { return; }
         $currentUrl = $this->currentUrl();
-        $analysis = $this->analyzer->analyzeHtml($content, $currentUrl);
-        $kind = $this->resolveKind($content, $analysis);
+
+        $sitewide = Db::activeForKind('sitewide');
+        // Полный разбор HTML (DOM + регулярки по всей странице) нужен только для сборки страничной
+        // разметки и проверки дублей. Если для этого URL нет страничных предложений, а есть только
+        // sitewide-блок (Organization/WebSite из готового JSON), тяжёлый анализ можно не запускать.
+        $hasRequest = Db::hasRequestProposals($this->candidateKindsForPath($currentUrl), $currentUrl);
+        if (!$sitewide && !$hasRequest) { return; }
+
+        $analysis = $hasRequest ? $this->analyzer->analyzeHtml($content, $currentUrl) : [];
         $schemas = [];
         $replaceTypes = [];
 
-        foreach (Db::activeForKind('sitewide') as $proposal) {
+        foreach ($sitewide as $proposal) {
             $decoded = json_decode((string)$proposal['SCHEMA_JSON'], true);
             if (is_array($decoded)) {
                 $schemas[] = ['proposal' => $proposal, 'schema' => $decoded, 'kind' => 'sitewide'];
@@ -30,21 +37,25 @@ class Output
             }
         }
 
-        foreach (Db::activeForRequest($kind, $currentUrl) as $proposal) {
-            $type = (string)$proposal['SCHEMA_TYPE'];
-            $replace = (string)($proposal['REPLACE_EXISTING'] ?? 'N') === 'Y';
-            if (!$replace && Options::get('avoid_duplicates', 'Y') === 'Y' && $this->hasEquivalentType($type, (array)($analysis['existing_schema_types'] ?? $analysis['json_ld_types']))) {
-                continue;
-            }
-            $proposalKind = (string)($proposal['PAGE_KIND'] ?: $kind);
-            $schema = $this->builder->buildForKind($proposalKind, $analysis, $type);
-            if ($schema) {
-                $schemas[] = ['proposal' => $proposal, 'schema' => $schema, 'kind' => $proposalKind];
-                if ($replace) { $replaceTypes[] = $type; }
+        if ($hasRequest) {
+            $kind = $this->resolveKind($content, $analysis);
+            foreach (Db::activeForRequest($kind, $currentUrl) as $proposal) {
+                $type = (string)$proposal['SCHEMA_TYPE'];
+                $replace = (string)($proposal['REPLACE_EXISTING'] ?? 'N') === 'Y';
+                if (!$replace && Options::get('avoid_duplicates', 'Y') === 'Y' && $this->hasEquivalentType($type, (array)($analysis['existing_schema_types'] ?? $analysis['json_ld_types']))) {
+                    continue;
+                }
+                $proposalKind = (string)($proposal['PAGE_KIND'] ?: $kind);
+                $schema = $this->builder->buildForKind($proposalKind, $analysis, $type);
+                if ($schema) {
+                    $schemas[] = ['proposal' => $proposal, 'schema' => $schema, 'kind' => $proposalKind];
+                    if ($replace) { $replaceTypes[] = $type; }
+                }
             }
         }
 
         if (!$schemas) { return; }
+        $this->ensureReferencedAnchors($schemas, $analysis);
         if ($replaceTypes) {
             $replaceTypes = array_values(array_unique($replaceTypes));
             $this->removeExistingJsonLdByType($content, $replaceTypes);
@@ -156,6 +167,44 @@ class Output
     {
         $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
         return $scheme . '://' . (string)($_SERVER['HTTP_HOST'] ?? '') . (string)($_SERVER['REQUEST_URI'] ?? '/');
+    }
+
+    // Возможные page_kind для этого пути (надмножество того, что вернёт resolveKind). Нужны только
+    // для дешёвой проверки Db::hasRequestProposals без полного разбора HTML.
+    private function candidateKindsForPath(string $url): array
+    {
+        $path = parse_url($url, PHP_URL_PATH) ?: '';
+        if (preg_match('~/(catalog|category|products?|shop)/~i', $path)) { return ['product_detail', 'product_category']; }
+        if (preg_match('~/(blog|articles|stati|news)/~i', $path)) { return ['blog_list', 'news_detail']; }
+        return [];
+    }
+
+    // Страничная разметка ссылается на #organization / #website по @id. Эти узлы существуют только
+    // если подтверждены sitewide-пункты. Если их нет в выводе и на странице, добавляем компактные
+    // Organization/WebSite из настроек, чтобы ссылки @id не «висли» в пустоту.
+    private function ensureReferencedAnchors(array &$schemas, array $analysis): void
+    {
+        $site = Security::normalizeUrl('/');
+        $present = [];
+        $refs = [];
+        foreach ($schemas as $entry) {
+            $schema = (array)$entry['schema'];
+            $id = (string)($schema['@id'] ?? '');
+            if ($id !== '') { $present[$id] = true; }
+            $json = (string)json_encode($schema, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            if (strpos($json, '#organization') !== false) { $refs['organization'] = true; }
+            if (strpos($json, '#website') !== false) { $refs['website'] = true; }
+        }
+        $anchors = [];
+        if (!empty($refs['organization']) && empty($present[$site . '#organization']) && !$this->hasEquivalentType('Organization', (array)($analysis['existing_schema_types'] ?? []))) {
+            $org = $this->builder->siteSchema('Organization');
+            if ($org) { $anchors[] = ['proposal' => ['SCHEMA_TYPE' => 'Organization', 'PAGE_KIND' => 'sitewide'], 'schema' => $org, 'kind' => 'sitewide']; }
+        }
+        if (!empty($refs['website']) && empty($present[$site . '#website']) && !$this->hasEquivalentType('WebSite', (array)($analysis['existing_schema_types'] ?? []))) {
+            $web = $this->builder->siteSchema('WebSite');
+            if ($web) { $anchors[] = ['proposal' => ['SCHEMA_TYPE' => 'WebSite', 'PAGE_KIND' => 'sitewide'], 'schema' => $web, 'kind' => 'sitewide']; }
+        }
+        if ($anchors) { $schemas = array_merge($anchors, $schemas); }
     }
 
     private function resolveKind(string $content, array $analysis): string
