@@ -253,7 +253,7 @@ class Scanner
         // 2. Затем точные служебные и коммерческие страницы интернет-магазина.
         if (preg_match('~/(contacts?|kontakty?)/~i', $path) || preg_match('~\b(контакты|адрес|как нас найти)\b~u', $title)) { return 'contact_page'; }
         if (preg_match('~/(reviews?|otzyv|otzivy|testimonials)/~i', $path) || preg_match('~\b(отзывы|отзывы о нас|мнения клиентов)\b~u', $title)) { return 'reviews_page'; }
-        if (preg_match('~/(faq|questions|vopros|voprosy|chasto-zadavaemye)~i', $path) || preg_match('~\b(faq|часто задаваемые вопросы|вопросы и ответы)\b~u', $haystack) || count($faq) >= 2) { return 'faq_page'; }
+        if (preg_match('~/(faq|questions|vopros|voprosy|chasto-zadavaemye)~i', $path) || preg_match('~\b(faq|часто задаваемые вопросы|вопросы и ответы)\b~u', $haystack)) { return 'faq_page'; }
         if (preg_match('~/(delivery|shipping|dostavka|how-to-delivery)/~i', $path) || preg_match('~\b(доставка|самовывоз|курьер|транспортная компания)\b~u', $title)) { return 'delivery_page'; }
         if (preg_match('~/(payment|oplata|pay|how-to-pay)/~i', $path) || preg_match('~\b(оплата|способы оплаты|банковской картой|сч[её]т на оплату)\b~u', $title)) { return 'payment_page'; }
         if (preg_match('~/(refund|return|vozvrat|garantiya|warranty)/~i', $path) || preg_match('~\b(возврат|гарантия|обмен товара|денежных средств)\b~u', $title)) { return 'returns_page'; }
@@ -279,7 +279,12 @@ class Scanner
         if (preg_match('~/(blog|articles|stati|news|obzory)/~i', $path) && (!empty($dates) || preg_match('/<article\b/i', $html) || preg_match('~/(blog|articles|stati|news|obzory)/[^/]+/[^/]+/?$~i', $path))) { return 'news_detail'; }
         if (preg_match('~/(blog|articles|stati|news|obzory)/~i', $path)) { return 'blog_list'; }
 
-        // 5. Если на странице много осмысленных внутренних элементов, это раздел/список, но не товар.
+        // 5. Контентный FAQ как fallback: несколько реальных пар вопрос-ответ, и это не служебная,
+        // юридическая или товарная страница — их пути уже отсеяны выше. Так политика/оферта с
+        // подзаголовками-вопросами не превращается в FAQPage.
+        if (count($faq) >= 2) { return 'faq_page'; }
+
+        // 6. Если на странице много осмысленных внутренних элементов, это раздел/список, но не товар.
         if (count($items) >= 6 && !$this->looksLikeProductDetail($analysis, $haystack, $path)) { return 'collection_page'; }
         return 'webpage';
     }
