@@ -258,6 +258,20 @@ class HtmlAnalyzer
 
     private function extractFaq(string $html): array
     {
+        $pairs = array_merge($this->faqFromAccordion($html), $this->faqFromHeadings($html));
+        $out = [];
+        $seen = [];
+        foreach ($pairs as $pair) {
+            $key = mb_strtolower($pair['question']);
+            if ($key === '' || isset($seen[$key])) { continue; }
+            $seen[$key] = true;
+            $out[] = $pair;
+        }
+        return array_slice($out, 0, 12);
+    }
+
+    private function faqFromHeadings(string $html): array
+    {
         $pairs = [];
         if (preg_match_all('/<(h[2-6]|summary)[^>]*>([^<]{5,200}\?)<\/\1>\s*<(p|div)[^>]*>(.*?)<\/\3>/isu', $html, $m, PREG_SET_ORDER)) {
             foreach ($m as $row) {
@@ -266,7 +280,57 @@ class HtmlAnalyzer
                 if ($q !== '' && $a !== '' && mb_strlen($a) > 20) { $pairs[] = ['question' => $q, 'answer' => mb_substr($a, 0, 1000)]; }
             }
         }
-        return array_slice(array_values(array_unique($pairs, SORT_REGULAR)), 0, 12);
+        return $pairs;
+    }
+
+    // Аспро Премьер / Битрикс выводят FAQ как Bootstrap-аккордеон: заголовок-вопрос с
+    // data-toggle="collapse" ссылается на скрытый блок с ответом по id. Разбираем такую пару.
+    private function faqFromAccordion(string $html): array
+    {
+        $dom = $this->dom($html);
+        if (!$dom) { return []; }
+        $xp = new \DOMXPath($dom);
+        $toggles = $xp->query('//*[@data-toggle="collapse" or @data-bs-toggle="collapse" or @aria-controls or (@href and starts-with(@href, "#")) or (@data-target and starts-with(@data-target, "#")) or (@data-bs-target and starts-with(@data-bs-target, "#"))]');
+        if (!$toggles || !$toggles->length) { return []; }
+        $pairs = [];
+        foreach ($toggles as $toggle) {
+            if (!$toggle instanceof \DOMElement) { continue; }
+            $question = $this->cleanText($toggle->textContent);
+            if ($question === '' || mb_strlen($question) < 6 || mb_strlen($question) > 250 || mb_substr($question, -1) !== '?') { continue; }
+            $targetId = $this->collapseTargetId($toggle);
+            if ($targetId === '') { continue; }
+            $target = $xp->query('//*[@id=' . $this->xpathLiteral($targetId) . ']')->item(0);
+            if (!$target instanceof \DOMElement) { continue; }
+            $answer = $this->cleanText($target->textContent);
+            // На случай, если триггер вложен в раскрываемый блок — убираем повтор вопроса из ответа.
+            if ($answer !== '' && mb_stripos($answer, $question) === 0) { $answer = trim(mb_substr($answer, mb_strlen($question))); }
+            if ($answer === '' || mb_strlen($answer) <= 20) { continue; }
+            $pairs[] = ['question' => $question, 'answer' => mb_substr($answer, 0, 1000)];
+            if (count($pairs) >= 12) { break; }
+        }
+        return $pairs;
+    }
+
+    private function collapseTargetId(\DOMElement $toggle): string
+    {
+        foreach (['data-target','data-bs-target','href'] as $attr) {
+            $value = trim($toggle->getAttribute($attr));
+            $hash = strpos($value, '#');
+            if ($value !== '' && $hash !== false) {
+                $id = substr($value, $hash + 1);
+                if ($id !== '') { return $id; }
+            }
+        }
+        $aria = trim($toggle->getAttribute('aria-controls'));
+        if ($aria !== '') { return preg_split('/\s+/', $aria)[0]; }
+        return '';
+    }
+
+    private function xpathLiteral(string $value): string
+    {
+        if (strpos($value, "'") === false) { return "'" . $value . "'"; }
+        if (strpos($value, '"') === false) { return '"' . $value . '"'; }
+        return "concat('" . str_replace("'", "',\"'\",'", $value) . "')";
     }
 
     private function extractVideos(string $html, string $url): array
