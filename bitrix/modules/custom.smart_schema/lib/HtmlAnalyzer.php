@@ -61,6 +61,7 @@ class HtmlAnalyzer
             'primary_image' => $this->primaryImage($images, $html, $url),
             'product' => $this->shouldExtractProductSignals($html, $url, $jsonLd) ? $this->extractProductSignals($html, $url, $jsonLd) : $this->emptyProductSignals($url),
             'microdata_product' => $this->shouldExtractProductSignals($html, $url, $jsonLd) ? $this->extractMicrodataProductSignals($html, $url) : $this->emptyMicrodataProductSignals(),
+            'book' => $this->shouldExtractProductSignals($html, $url, $jsonLd) ? $this->bookSignals($html, $url, $jsonLd) : $this->emptyBookSignals(),
             'items' => $this->extractListItems($html, $url, $jsonLd),
             'reviews' => $this->extractReviews($html, $url),
             'dates' => $this->extractDates($html),
@@ -413,6 +414,83 @@ class HtmlAnalyzer
             'url' => Security::normalizeUrl($url),
             'image' => '',
         ];
+    }
+
+    private function emptyBookSignals(): array
+    {
+        return ['author' => '', 'isbn' => '', 'inLanguage' => '', 'bookFormat' => '', 'numberOfPages' => '', 'publisher' => ''];
+    }
+
+    // Книжные признаки товара для мульти-типа Product+Book. Только реальные данные страницы:
+    // существующий JSON-LD Book, свойства карточки Аспро (Автор/Язык/ISBN/Переплёт/Страниц) и текст.
+    private function bookSignals(string $html, string $url, array $jsonLd): array
+    {
+        $book = $this->emptyBookSignals();
+        foreach ($jsonLd as $schema) {
+            foreach ($this->findNodesByType($schema, ['Book']) as $node) {
+                if ($book['author'] === '') { $book['author'] = $this->personName($node['author'] ?? ''); }
+                if ($book['isbn'] === '') { $book['isbn'] = $this->cleanIsbn((string)($node['isbn'] ?? '')); }
+                if ($book['inLanguage'] === '' && !is_array($node['inLanguage'] ?? null)) { $book['inLanguage'] = $this->languageCode((string)($node['inLanguage'] ?? '')); }
+                if ($book['numberOfPages'] === '' && !empty($node['numberOfPages'])) { $book['numberOfPages'] = preg_replace('/\D+/', '', (string)$node['numberOfPages']) ?: ''; }
+                if ($book['bookFormat'] === '') { $book['bookFormat'] = $this->bookFormatCode((string)($node['bookFormat'] ?? '')); }
+            }
+        }
+        foreach ($this->extractProductProperties($html) as $title => $value) {
+            $t = mb_strtolower((string)$title);
+            $v = $this->cleanProductValue((string)$value);
+            if ($v === '') { continue; }
+            if ($book['author'] === '' && (mb_strpos($t, 'автор') !== false || mb_strpos($t, 'author') !== false)) { $book['author'] = $v; }
+            elseif ($book['publisher'] === '' && (mb_strpos($t, 'издательств') !== false || mb_strpos($t, 'издатель') !== false || mb_strpos($t, 'publisher') !== false)) { $book['publisher'] = $v; }
+            elseif ($book['inLanguage'] === '' && (mb_strpos($t, 'язык') !== false || mb_strpos($t, 'language') !== false)) { $book['inLanguage'] = $this->languageCode($v); }
+            elseif ($book['numberOfPages'] === '' && (mb_strpos($t, 'страниц') !== false || mb_strpos($t, 'кол-во стр') !== false || mb_strpos($t, 'объ[её]м') !== false)) { if (preg_match('/\d+/', $v, $m)) { $book['numberOfPages'] = $m[0]; } }
+            elseif ($book['bookFormat'] === '' && (mb_strpos($t, 'переплёт') !== false || mb_strpos($t, 'переплет') !== false || mb_strpos($t, 'обложк') !== false || mb_strpos($t, 'тип издания') !== false || mb_strpos($t, 'формат издания') !== false)) { $book['bookFormat'] = $this->bookFormatCode($v); }
+            elseif ($book['isbn'] === '' && mb_strpos($t, 'isbn') !== false) { $book['isbn'] = $this->cleanIsbn($v); }
+        }
+        if ($book['isbn'] === '') {
+            $plain = Security::text($html, 60000);
+            if (preg_match('/ISBN[\s:]*([0-9][0-9\-\x{2013}\s]{8,18}[0-9Xx])/u', $plain, $m)) { $book['isbn'] = $this->cleanIsbn($m[1]); }
+        }
+        return $book;
+    }
+
+    private function personName($author): string
+    {
+        if (is_array($author)) {
+            if (isset($author[0])) { return $this->personName($author[0]); }
+            return $this->normalizeItemName((string)($author['name'] ?? ''));
+        }
+        return $this->normalizeItemName((string)$author);
+    }
+
+    private function cleanIsbn(string $value): string
+    {
+        $value = strtoupper(preg_replace('/[^0-9Xx]/', '', $value) ?? '');
+        return (strlen($value) === 10 || strlen($value) === 13) ? $value : '';
+    }
+
+    private function languageCode(string $value): string
+    {
+        $value = mb_strtolower(trim($value));
+        if ($value === '') { return ''; }
+        $map = [
+            'английск' => 'en', 'english' => 'en', 'русск' => 'ru', 'немецк' => 'de', 'deutsch' => 'de',
+            'французск' => 'fr', 'испанск' => 'es', 'итальянск' => 'it', 'китайск' => 'zh', 'японск' => 'ja',
+            'корейск' => 'ko', 'арабск' => 'ar', 'португальск' => 'pt', 'турецк' => 'tr', 'польск' => 'pl',
+        ];
+        foreach ($map as $name => $code) { if (mb_strpos($value, $name) !== false) { return $code; } }
+        return preg_match('/^[a-z]{2}(-[a-z]{2})?$/', $value) ? $value : '';
+    }
+
+    private function bookFormatCode(string $value): string
+    {
+        $value = mb_strtolower(trim($value));
+        if ($value === '') { return ''; }
+        if (preg_match('~^https?://schema\.org/(\w+)~i', $value, $m)) { return 'https://schema.org/' . $m[1]; }
+        if (preg_match('~(тв[её]рд|hardcover|hardback|тв\.?\s*пер)~u', $value)) { return 'https://schema.org/Hardcover'; }
+        if (preg_match('~(мягк|обл\.|paperback|softcover|брошюр)~u', $value)) { return 'https://schema.org/Paperback'; }
+        if (preg_match('~(электрон|e-?book|pdf|epub|цифров)~u', $value)) { return 'https://schema.org/EBook'; }
+        if (preg_match('~(аудио|audio)~u', $value)) { return 'https://schema.org/AudiobookFormat'; }
+        return '';
     }
 
     private function emptyMicrodataProductSignals(): array
@@ -935,7 +1013,9 @@ class HtmlAnalyzer
     {
         $value = $this->cleanText($value);
         $value = preg_replace('/\s+/u', ' ', $value) ?: '';
-        $value = trim($value, " \t\n\r\0\x0B·›»/");
+        // Многобайтно-безопасная обрезка: обычный trim() режет по байтам и портит хвостовые
+        // кириллические буквы, у которых последний байт совпадает с байтом символов ·›».
+        $value = preg_replace('~^[\s\x00·›»/]+|[\s\x00·›»/]+$~u', '', $value) ?? $value;
         if ($value === '' || mb_strlen($value) > 200) { return ''; }
         if (preg_match('/^(0|войти|кабинет|корзина|избранное|меню|сайт|администрирование)$/iu', $value)) { return ''; }
         return $value;

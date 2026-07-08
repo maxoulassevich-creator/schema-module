@@ -286,6 +286,21 @@ class Db
         return $counts;
     }
 
+    // Массовый откат: снимает вывод со ВСЕХ внедрённых пунктов (в т.ч. оставшихся от прошлых
+    // версий модуля). Данные и история сохраняются — пункты можно внести заново. Возвращает
+    // число откатанных пунктов.
+    public static function rollbackAllApplied(string $message = ''): int
+    {
+        self::install();
+        $connection = Application::getConnection();
+        $count = (int)($connection->query("SELECT COUNT(*) CNT FROM " . self::PROPOSALS . " WHERE STATUS IN ('applied','approved')")->fetch()['CNT'] ?? 0);
+        if ($count > 0) {
+            $connection->queryExecute("UPDATE " . self::PROPOSALS . " SET STATUS='rolled_back', ROLLED_BACK_AT=NOW(), UPDATED_AT=NOW(), VERIFY_STATUS='', VERIFY_MESSAGE='', VERIFY_JSON='', VERIFIED_AT=NULL WHERE STATUS IN ('applied','approved')");
+        }
+        self::log(null, 'rollback_all', $message ?: ('Массовый откат всех внедрённых пунктов. Откатано: ' . $count . '. Динамический вывод остановлен, данные сохранены.'), ['count' => $count]);
+        return $count;
+    }
+
     public static function clearAll(): void
     {
         self::install();

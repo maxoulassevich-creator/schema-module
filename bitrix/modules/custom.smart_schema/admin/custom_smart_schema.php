@@ -28,6 +28,9 @@ if ($action && check_bitrix_sessid()) {
         } elseif ($action === 'clear') {
             Db::clearAll();
             $message = 'Результаты и журнал очищены.';
+        } elseif ($action === 'rollback_all') {
+            $n = Db::rollbackAllApplied();
+            $message = 'Откат выполнен для всех внедрённых пунктов: ' . (int)$n . '. Динамический вывод разметки остановлен на всех страницах, данные и история сохранены.';
         } elseif ($action === 'status') {
             $id = (int)$request->get('id');
             $status = (string)$request->get('status');
@@ -79,9 +82,11 @@ $counts = Db::counts();
             <?= bitrix_sessid_post() ?>
             <input type="hidden" name="action" value="scan">
             <input type="submit" class="adm-btn-save" value="Проанализировать типовые и ручные страницы">
-            <a class="adm-btn" href="custom_smart_schema.php?action=clear&<?=bitrix_sessid_get()?>" onclick="return confirm('Удалить все предложения и журнал?')">Очистить всё</a>
+            <a class="adm-btn" href="custom_smart_schema.php?action=rollback_all&<?=bitrix_sessid_get()?>" onclick="return confirm('Откатить ВСЕ внедрённые пункты (включая оставшиеся от прошлых версий модуля)? Динамический вывод разметки прекратится на всех страницах сайта. Данные и история сохранятся — при необходимости можно внести заново.')">Откатить все внедрения (<?= (int)$counts['applied'] ?>)</a>
+            <a class="adm-btn" href="custom_smart_schema.php?action=clear&<?=bitrix_sessid_get()?>" onclick="return confirm('Удалить ВСЕ предложения и журнал безвозвратно? В отличие от отката, восстановить будет нельзя.')">Очистить всё</a>
         </form>
         <p><b>Принцип работы:</b> модуль анализирует по одному реальному URL для каждого типового шаблона и дополнительные URL из ручного списка. После подтверждения выводит JSON-LD динамически для страниц этого же типа или только для конкретного ручного URL. Все товары по одному не сканируются.</p>
+        <p><b>Откат и переустановка:</b> вся разметка выводится динамически, поэтому «Откатить все внедрения» мгновенно убирает её со всех страниц (файлы шаблона и товары не меняются). Подтверждённые пункты и журнал хранятся в БД и переживают переустановку модуля — при удалении оставляйте включённой галочку «Сохранить таблицы и настройки», тогда после установки новой версии все прошлые внедрения снова будут видны здесь и их можно откатить.</p>
     </div>
 </td></tr>
 <?php $tabControl->BeginNextTab(); $opt = Options::all(); ?>
@@ -135,6 +140,7 @@ $counts = Db::counts();
 <?php $tabControl->BeginNextTab(); $items = Db::proposals(); ?>
 <tr><td>
 <div class="smart-schema-box">
+<p>Внедрено сейчас: <b><?= (int)$counts['applied'] ?></b>. <a class="adm-btn" href="custom_smart_schema.php?action=rollback_all&<?=bitrix_sessid_get()?>" onclick="return confirm('Откатить ВСЕ внедрённые пункты (включая оставшиеся от прошлых версий модуля)? Динамический вывод разметки прекратится на всех страницах. Данные и история сохранятся.')">Откатить все внедрения</a></p>
 <table class="smart-schema-table">
 <tr><th>ID</th><th>Тип страницы</th><th>Schema</th><th>Статус</th><th>Что внести</th><th>Действия</th></tr>
 <?php foreach ($items as $item): $status = (string)$item['STATUS']; ?>

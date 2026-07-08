@@ -158,6 +158,11 @@ class SchemaBuilder
     public function product(array $analysis, string $type = 'Product'): array
     {
         $product = (array)($analysis['product'] ?? []);
+        $book = (array)($analysis['book'] ?? []);
+        // Мульти-тип Product+Book: товарные поля (offers/brand/наличие) остаются для Яндекс Товаров,
+        // а книжные (author/isbn/язык/формат) добавляются как смысловой слой. Book включаем только
+        // если это реально книга — найден автор или ISBN.
+        $isBook = ($book['author'] ?? '') !== '' || ($book['isbn'] ?? '') !== '';
         $url = $product['url'] ?? ($analysis['canonical'] ?? $analysis['url'] ?? Security::normalizeUrl('/'));
         $offer = [];
         if (!empty($product['price']) && !empty($product['priceCurrency'])) {
@@ -172,7 +177,7 @@ class SchemaBuilder
         }
         $schema = [
             '@context' => 'https://schema.org',
-            '@type' => $type,
+            '@type' => $isBook ? [$type, 'Book'] : $type,
             '@id' => $url . ($type === 'ProductGroup' ? '#productgroup' : '#product'),
             'name' => $product['name'] ?: $this->name($analysis),
             'description' => $this->description($analysis),
@@ -182,6 +187,17 @@ class SchemaBuilder
             'image' => $product['image'] ? [Security::absUrl((string)$product['image'], $url)] : null,
             'offers' => $offer ?: null,
         ];
+        if ($isBook) {
+            $isbn = (string)($book['isbn'] ?? '');
+            $publisher = ($book['publisher'] ?? '') !== '' ? (string)$book['publisher'] : (string)($product['brand'] ?? '');
+            $schema['author'] = ($book['author'] ?? '') !== '' ? ['@type' => 'Person', 'name' => $book['author']] : null;
+            $schema['isbn'] = $isbn ?: null;
+            $schema['gtin13'] = strlen($isbn) === 13 ? $isbn : null;
+            $schema['bookFormat'] = ($book['bookFormat'] ?? '') !== '' ? $book['bookFormat'] : null;
+            $schema['inLanguage'] = ($book['inLanguage'] ?? '') !== '' ? $book['inLanguage'] : null;
+            $schema['numberOfPages'] = ($book['numberOfPages'] ?? '') !== '' ? (int)$book['numberOfPages'] : null;
+            $schema['publisher'] = $publisher !== '' ? ['@type' => 'Organization', 'name' => $publisher] : null;
+        }
         if ($type === 'ProductGroup') {
             $schema['productGroupID'] = $schema['sku'] ?: null;
             unset($schema['offers']);
