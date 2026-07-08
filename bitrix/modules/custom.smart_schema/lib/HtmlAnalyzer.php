@@ -418,11 +418,12 @@ class HtmlAnalyzer
 
     private function emptyBookSignals(): array
     {
-        return ['author' => '', 'isbn' => '', 'inLanguage' => '', 'bookFormat' => '', 'numberOfPages' => '', 'publisher' => ''];
+        return ['author' => '', 'isbn' => '', 'inLanguage' => '', 'bookFormat' => '', 'numberOfPages' => '', 'publisher' => '', 'datePublished' => '', 'typicalAgeRange' => ''];
     }
 
     // Книжные признаки товара для мульти-типа Product+Book. Только реальные данные страницы:
-    // существующий JSON-LD Book, свойства карточки Аспро (Автор/Язык/ISBN/Переплёт/Страниц) и текст.
+    // существующий JSON-LD Book, свойства-пары (additionalProperty из Product JSON-LD и карточка
+    // Аспро js-prop) и текст. Ничего не выдумываем.
     private function bookSignals(string $html, string $url, array $jsonLd): array
     {
         $book = $this->emptyBookSignals();
@@ -434,23 +435,36 @@ class HtmlAnalyzer
                 if ($book['numberOfPages'] === '' && !empty($node['numberOfPages'])) { $book['numberOfPages'] = preg_replace('/\D+/', '', (string)$node['numberOfPages']) ?: ''; }
                 if ($book['bookFormat'] === '') { $book['bookFormat'] = $this->bookFormatCode((string)($node['bookFormat'] ?? '')); }
             }
+            // additionalProperty у существующего Product/ProductGroup — самый надёжный источник в Аспро.
+            foreach ($this->findNodesByType($schema, ['Product', 'ProductGroup']) as $node) {
+                foreach ((array)($node['additionalProperty'] ?? []) as $prop) {
+                    if (is_array($prop)) { $this->applyBookProperty($book, (string)($prop['name'] ?? ''), (string)($prop['value'] ?? '')); }
+                }
+            }
         }
         foreach ($this->extractProductProperties($html) as $title => $value) {
-            $t = mb_strtolower((string)$title);
-            $v = $this->cleanProductValue((string)$value);
-            if ($v === '') { continue; }
-            if ($book['author'] === '' && (mb_strpos($t, 'автор') !== false || mb_strpos($t, 'author') !== false)) { $book['author'] = $v; }
-            elseif ($book['publisher'] === '' && (mb_strpos($t, 'издательств') !== false || mb_strpos($t, 'издатель') !== false || mb_strpos($t, 'publisher') !== false)) { $book['publisher'] = $v; }
-            elseif ($book['inLanguage'] === '' && (mb_strpos($t, 'язык') !== false || mb_strpos($t, 'language') !== false)) { $book['inLanguage'] = $this->languageCode($v); }
-            elseif ($book['numberOfPages'] === '' && (mb_strpos($t, 'страниц') !== false || mb_strpos($t, 'кол-во стр') !== false || mb_strpos($t, 'объ[её]м') !== false)) { if (preg_match('/\d+/', $v, $m)) { $book['numberOfPages'] = $m[0]; } }
-            elseif ($book['bookFormat'] === '' && (mb_strpos($t, 'переплёт') !== false || mb_strpos($t, 'переплет') !== false || mb_strpos($t, 'обложк') !== false || mb_strpos($t, 'тип издания') !== false || mb_strpos($t, 'формат издания') !== false)) { $book['bookFormat'] = $this->bookFormatCode($v); }
-            elseif ($book['isbn'] === '' && mb_strpos($t, 'isbn') !== false) { $book['isbn'] = $this->cleanIsbn($v); }
+            $this->applyBookProperty($book, (string)$title, (string)$value);
         }
         if ($book['isbn'] === '') {
             $plain = Security::text($html, 60000);
             if (preg_match('/ISBN[\s:]*([0-9][0-9\-\x{2013}\s]{8,18}[0-9Xx])/u', $plain, $m)) { $book['isbn'] = $this->cleanIsbn($m[1]); }
         }
         return $book;
+    }
+
+    private function applyBookProperty(array &$book, string $title, string $value): void
+    {
+        $t = mb_strtolower(trim($title));
+        $v = $this->cleanProductValue($value);
+        if ($t === '' || $v === '') { return; }
+        if ($book['author'] === '' && (mb_strpos($t, 'автор') !== false || mb_strpos($t, 'author') !== false)) { $book['author'] = $v; }
+        elseif ($book['publisher'] === '' && (mb_strpos($t, 'издательств') !== false || mb_strpos($t, 'издатель') !== false || mb_strpos($t, 'publisher') !== false)) { $book['publisher'] = $v; }
+        elseif ($book['inLanguage'] === '' && (mb_strpos($t, 'язык') !== false || mb_strpos($t, 'language') !== false)) { $book['inLanguage'] = $this->languageCode($v); }
+        elseif ($book['numberOfPages'] === '' && (mb_strpos($t, 'страниц') !== false || mb_strpos($t, 'кол-во стр') !== false || mb_strpos($t, 'объем') !== false || mb_strpos($t, 'объём') !== false)) { if (preg_match('/\d+/', $v, $m)) { $book['numberOfPages'] = $m[0]; } }
+        elseif ($book['bookFormat'] === '' && (mb_strpos($t, 'формат') !== false || mb_strpos($t, 'переплёт') !== false || mb_strpos($t, 'переплет') !== false || mb_strpos($t, 'обложк') !== false || mb_strpos($t, 'тип издания') !== false)) { $book['bookFormat'] = $this->bookFormatCode($v); }
+        elseif ($book['datePublished'] === '' && (mb_strpos($t, 'год издания') !== false || mb_strpos($t, 'год публикации') !== false)) { if (preg_match('/(19|20)\d{2}/', $v, $m)) { $book['datePublished'] = $m[0]; } }
+        elseif ($book['typicalAgeRange'] === '' && (mb_strpos($t, 'рекомендуемый возраст') !== false || mb_strpos($t, 'рекомендованный возраст') !== false)) { $book['typicalAgeRange'] = mb_substr($v, 0, 20); }
+        elseif ($book['isbn'] === '' && mb_strpos($t, 'isbn') !== false) { $book['isbn'] = $this->cleanIsbn($v); }
     }
 
     private function personName($author): string
@@ -558,10 +572,9 @@ class HtmlAnalyzer
         foreach ($fromDom as $key => $value) {
             if (($product[$key] ?? '') === '' && $value !== '') { $product[$key] = $value; }
         }
-        if (($product['brand'] ?? '') === '' && Options::get('product_brand_fallback', 'organization') === 'organization') {
-            $fallbackBrand = Options::get('organization_name') ?: Options::get('site_name');
-            if ($fallbackBrand !== '') { $product['brand'] = $this->cleanProductValue($fallbackBrand); }
-        }
+        // Brand оставляем как есть (реальный бренд со страницы или пусто). Fallback на название
+        // организации применяется в SchemaBuilder::product(), где известно, книга это или нет:
+        // магазин не должен становиться брендом книги.
         return $product;
     }
 

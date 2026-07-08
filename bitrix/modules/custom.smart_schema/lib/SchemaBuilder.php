@@ -162,8 +162,24 @@ class SchemaBuilder
         // Мульти-тип Product+Book: товарные поля (offers/brand/наличие) остаются для Яндекс Товаров,
         // а книжные (author/isbn/язык/формат) добавляются как смысловой слой. Book включаем только
         // если это реально книга — найден автор или ISBN.
-        $isBook = ($book['author'] ?? '') !== '' || ($book['isbn'] ?? '') !== '';
+        // ISBN: из книжных данных, иначе из SKU, если он выглядит как ISBN-13/10 (у книг SKU = ISBN).
+        $isbn = (string)($book['isbn'] ?? '');
+        if ($isbn === '' && preg_match('/^(97[89]\d{10}|\d{9}[\dXx])$/', (string)($product['sku'] ?? ''))) {
+            $isbn = strtoupper((string)$product['sku']);
+        }
+        $isBook = ($book['author'] ?? '') !== '' || $isbn !== '';
         $url = $product['url'] ?? ($analysis['canonical'] ?? $analysis['url'] ?? Security::normalizeUrl('/'));
+        // Бренд: реальный бренд со страницы. Для книг магазин брендом не делаем — только издатель.
+        // Для не-книг сохраняем прежний fallback на название организации (настройка 1.0.7).
+        $realBrand = (string)($product['brand'] ?? '');
+        if ($isBook) {
+            $brandName = $realBrand !== '' ? $realBrand : (string)($book['publisher'] ?? '');
+        } else {
+            $brandName = $realBrand;
+            if ($brandName === '' && Options::get('product_brand_fallback', 'organization') === 'organization') {
+                $brandName = (string)(Options::get('organization_name') ?: Options::get('site_name'));
+            }
+        }
         $offer = [];
         if (!empty($product['price']) && !empty($product['priceCurrency'])) {
             $offer = [
@@ -183,20 +199,21 @@ class SchemaBuilder
             'description' => $this->description($analysis),
             'url' => $url,
             'sku' => $product['sku'] ?: null,
-            'brand' => $product['brand'] ? ['@type' => 'Brand', 'name' => $product['brand']] : null,
+            'brand' => $brandName !== '' ? ['@type' => 'Brand', 'name' => $brandName] : null,
             'image' => $product['image'] ? [Security::absUrl((string)$product['image'], $url)] : null,
             'offers' => $offer ?: null,
         ];
         if ($isBook) {
-            $isbn = (string)($book['isbn'] ?? '');
-            $publisher = ($book['publisher'] ?? '') !== '' ? (string)$book['publisher'] : (string)($product['brand'] ?? '');
             $schema['author'] = ($book['author'] ?? '') !== '' ? ['@type' => 'Person', 'name' => $book['author']] : null;
             $schema['isbn'] = $isbn ?: null;
             $schema['gtin13'] = strlen($isbn) === 13 ? $isbn : null;
             $schema['bookFormat'] = ($book['bookFormat'] ?? '') !== '' ? $book['bookFormat'] : null;
             $schema['inLanguage'] = ($book['inLanguage'] ?? '') !== '' ? $book['inLanguage'] : null;
             $schema['numberOfPages'] = ($book['numberOfPages'] ?? '') !== '' ? (int)$book['numberOfPages'] : null;
-            $schema['publisher'] = $publisher !== '' ? ['@type' => 'Organization', 'name' => $publisher] : null;
+            $schema['datePublished'] = ($book['datePublished'] ?? '') !== '' ? (string)$book['datePublished'] : null;
+            $schema['typicalAgeRange'] = ($book['typicalAgeRange'] ?? '') !== '' ? (string)$book['typicalAgeRange'] : null;
+            // publisher выводим только если это реальный издатель со страницы (не магазин).
+            $schema['publisher'] = ($book['publisher'] ?? '') !== '' ? ['@type' => 'Organization', 'name' => $book['publisher']] : null;
         }
         if ($type === 'ProductGroup') {
             $schema['productGroupID'] = $schema['sku'] ?: null;
